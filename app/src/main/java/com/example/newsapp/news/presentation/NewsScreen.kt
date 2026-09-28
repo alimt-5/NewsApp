@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.SubcomposeAsyncImage
+import com.example.newsapp.core.domain.AppLanguage
 import com.example.newsapp.core.domain.Article
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
@@ -91,7 +92,7 @@ fun NewsScreen(
                 }, windowInsets = WindowInsets(top = 30.dp, bottom = 5.dp),
                 actions = {
                     LanguageSwitcher(
-                        currentLanguage = state.value.language,
+                        enabled = state.value.isOnline,
                         onLanguageChange = { onAction(NewsActions.ChangeLanguage(it)) }
                     )
                 }
@@ -124,7 +125,10 @@ fun NewsScreen(
                         val totalItem = listState.layoutInfo.totalItemsCount
                         val lastVisibleIndex =
                             listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                        lastVisibleIndex == totalItem - 1 && !state.value.isLoading
+                        lastVisibleIndex == totalItem - 1 &&
+                                !state.value.isLoading &&
+                                state.value.isOnline &&
+                                state.value.nextPage != null
                     }
                 }
 
@@ -220,35 +224,46 @@ fun ArticleItem(
     }
     HorizontalDivider(thickness = 2.dp)
 }
+
+
 @Composable
 fun LanguageSwitcher(
-    currentLanguage: String,
-    onLanguageChange: (String) -> Unit
+    enabled: Boolean,
+    onLanguageChange: (AppLanguage) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
 
+    LaunchedEffect(enabled) {
+        if (!enabled) expanded = false
+    }
+
     Box {
-        IconButton(onClick = { expanded = true }) {
+        IconButton(
+            enabled = enabled,
+            onClick = { expanded = true }
+        ) {
             Icon(
                 imageVector = Icons.Default.Language,
                 contentDescription = "Change Language"
             )
         }
+
         DropdownMenu(
-            expanded = expanded,
+            expanded = expanded && enabled,
             onDismissRequest = { expanded = false }
         ) {
             DropdownMenuItem(
                 text = { Text("English") },
                 onClick = {
-                    onLanguageChange("en")
+                    onLanguageChange(AppLanguage.ENGLISH)
                     expanded = false
                 }
             )
+
             DropdownMenuItem(
-                text = { Text("فارسی") },
+                text = { Text("Persian") },
                 onClick = {
-                    onLanguageChange("fa")
+                    onLanguageChange(AppLanguage.PERSIAN)
                     expanded = false
                 }
             )

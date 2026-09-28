@@ -2,20 +2,35 @@ package com.example.newsapp.news.presentation
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.newsapp.core.domain.NewsRepository
+import com.example.newsapp.core.domain.AppLanguage
+import com.example.newsapp.core.domain.NetworkMonitor
 import com.example.newsapp.core.domain.NewsResult
+import com.example.newsapp.core.domain.usecase.GetNextNewsPageUseCase
+import com.example.newsapp.core.domain.usecase.GetNewsUseCase
+import com.example.newsapp.core.domain.usecase.ObserveLanguageUseCase
+import com.example.newsapp.core.domain.usecase.SetLanguageUseCase
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 class NewsViewModel(
-    private val newsRepository: NewsRepository
+    private val getNewsUseCase: GetNewsUseCase,
+    private val getNextNewsPageUseCase: GetNextNewsPageUseCase,
+    private val observeLanguageUseCase: ObserveLanguageUseCase,
+    private val setLanguageUseCase: SetLanguageUseCase,
+    private val networkMonitor: NetworkMonitor
 ) : ViewModel() {
 
-    private var _state = MutableStateFlow(NewsState())
+    private val _state = MutableStateFlow(NewsState())
     val state = _state.asStateFlow()
 
-    init { loadNews() }
+    init {
+        observeLanguageAndNetwork()
+    }
 
     fun onActions(actions: NewsActions) {
         when (actions) {
@@ -24,74 +39,109 @@ class NewsViewModel(
         }
     }
 
-    private fun changeLanguage(language: String) {
-        if (language == _state.value.language) return
+    private fun observeLanguageAndNetwork() {
+        viewModelScope.launch {
+            combine(
+                observeLanguageUseCase(),
+                networkMonitor.isOnline
+            ) { language, isOnline ->
+                language to isOnline
+            }.distinctUntilChanged().collectLatest { (language, isOnline) ->
+                _state.update {
+                    it.copy(
+                        language = language,
+                        isOnline = isOnline,
+                        articleList = if (it.language != language) emptyList() else it.articleList,
+                        nextPage = if (it.language != language) null else it.nextPage,
+                        isError = false
+                    )
+                }
 
-        _state.value = _state.value.copy(
-            language = language,
-            articleList = emptyList(),
-            nextPage = null,
-            isError = false
-        )
-        loadNews()
+                loadNews()
+            }
+        }
     }
 
-    private fun loadNews() {
-        viewModelScope.launch {
-            _state.value = _state.value.copy(isLoading = true)
-            newsRepository.getNews(_state.value.language).collect { result ->
-                when (result) {
-                    is NewsResult.Error<*> -> {
-                        _state.value = _state.value.copy(isError = true
-                        )
-                    }
+    private fun changeLanguage(language: AppLanguage) {
+        if (
+            !_state.value.isOnline ||
+            !networkMonitor.isCurrentlyOnline() ||
+            language == _state.value.language
+        ) return
 
-                    is NewsResult.Success<*> -> {
-                        _state.value = _state.value.copy(
+        viewModelScope.launch {
+            setLanguageUseCase(language)
+        }
+    }
+
+    private suspend fun loadNews() {
+        _state.update {
+            it.copy(isLoading = true)
+        }
+
+        getNewsUseCase().collect { result ->
+            when (result) {
+                is NewsResult.Error<*> -> {
+                    _state.update {
+                        it.copy(isError = true)
+                    }
+                }
+
+                is NewsResult.Success<*> -> {
+                    _state.update {
+                        it.copy(
                             isError = false,
                             articleList = result.data?.articles ?: emptyList(),
                             nextPage = result.data?.nextPage
                         )
                     }
                 }
-
             }
+        }
 
-            _state.value = _state.value.copy(
-                isLoading = false
-            )
+        _state.update {
+            it.copy(isLoading = false)
         }
     }
 
     private fun pagination() {
-        viewModelScope.launch {
-            _state.value = _state.value.copy(
-                isLoading = true
-            )
-            newsRepository.pagination(_state.value.nextPage, _state.value.language)
-                .collect { result ->
-                    when (result) {
-                        is NewsResult.Error<*> -> {
-                            _state.value = _state.value.copy(
-                                isError = true
-                            )
-                        }
+        val currentState = _state.value
+        val nextPage = currentState.nextPage
 
-                        is NewsResult.Success<*> -> {
-                            _state.value = _state.value.copy(
-                                isError = false, articleList = _state.value.articleList.plus(
-                                    result.data?.articles ?: emptyList()
-                                ), nextPage = result.data?.nextPage
-                            )
+        if (
+            !currentState.isOnline ||
+            currentState.isLoading ||
+            nextPage.isNullOrBlank()
+        ) return
+
+        viewModelScope.launch {
+            _state.update {
+                it.copy(isLoading = true)
+            }
+
+            getNextNewsPageUseCase(nextPage).collect { result ->
+                when (result) {
+                    is NewsResult.Error<*> -> {
+                        _state.update {
+                            it.copy(isError = true)
                         }
                     }
 
+                    is NewsResult.Success<*> -> {
+                        _state.update {
+                            it.copy(
+                                isError = false,
+                                articleList = it.articleList + (result.data?.articles ?: emptyList()),
+                                nextPage = result.data?.nextPage
+                            )
+                        }
+                    }
                 }
+            }
 
-            _state.value = _state.value.copy(
-                isLoading = false
-            )
+            _state.update {
+                it.copy(isLoading = false)
+            }
         }
     }
-
 }

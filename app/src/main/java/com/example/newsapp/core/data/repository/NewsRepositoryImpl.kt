@@ -7,7 +7,10 @@ import com.example.newsapp.core.data.remote.NewsListDto
 import com.example.newsapp.core.data.toArticle
 import com.example.newsapp.core.data.toArticleEntity
 import com.example.newsapp.core.data.toNewsList
+import com.example.newsapp.core.domain.AppLanguage
 import com.example.newsapp.core.domain.Article
+import com.example.newsapp.core.domain.LanguageRepository
+import com.example.newsapp.core.domain.NetworkMonitor
 import com.example.newsapp.core.domain.NewsList
 import com.example.newsapp.core.domain.NewsRepository
 import com.example.newsapp.core.domain.NewsResult
@@ -21,7 +24,9 @@ import kotlinx.coroutines.flow.flow
 
 class NewsRepositoryImpl(
     private val httpClient: HttpClient,
-    private val articleDao: ArticleDao
+    private val articleDao: ArticleDao,
+    private val languageRepository: LanguageRepository,
+    private val networkMonitor: NetworkMonitor
 ) : NewsRepository {
 
     private suspend fun getRemote(nextPage: String?, language: String): NewsList {
@@ -34,77 +39,119 @@ class NewsRepositoryImpl(
     }
 
     private suspend fun getLocal(nextPage: String?): NewsList {
-        val localNews = articleDao.getArticleList()
         return NewsList(
             nextPage = nextPage,
-            articles = localNews.map { it.toArticle() }
+            articles = articleDao.getArticleList().map { it.toArticle() }
         )
     }
 
-    override suspend fun getNews(language: String): Flow<NewsResult<NewsList>> {
-        return flow {
-            val remoteNewsList = try {
-                getRemote(null,language)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                if (e is CancellationException) throw e
-                null
-            }
-            remoteNewsList?.let {
-                articleDao.clearDatabase()
-                articleDao.upsertArticle(remoteNewsList.articles.map { it.toArticleEntity() })
-                emit(NewsResult.Success(getLocal(nextPage = remoteNewsList.nextPage)))
-                return@flow
-            }
-
+    override suspend fun getNews(): Flow<NewsResult<NewsList>> = flow {
+        val language = languageRepository.getLanguage().toApiCode()
+        if (!networkMonitor.isCurrentlyOnline()) {
             val localNewsList = getLocal(null)
             if (localNewsList.articles.isNotEmpty()) {
                 emit(NewsResult.Success(localNewsList))
-                return@flow
+            } else {
+                emit(NewsResult.Error("No Data"))
             }
+            return@flow
+        }
+        val remoteNewsList = try {
+            getRemote(null, language)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            if (e is CancellationException) throw e
+            null
+        }
+
+        remoteNewsList?.let {
+            articleDao.clearDatabase()
+            articleDao.upsertArticle(
+                it.articles.map { article -> article.toArticleEntity() }
+            )
+            emit(NewsResult.Success(it))
+            return@flow
+        }
+
+        val localNewsList = getLocal(null)
+        if (localNewsList.articles.isNotEmpty()) {
+            emit(NewsResult.Success(localNewsList))
+        } else {
             emit(NewsResult.Error("No Data"))
         }
     }
 
-    override suspend fun getArticle(articleId: String): Flow<NewsResult<Article>> {
-        return flow {
-            articleDao.getArticleById(articleId)?.let { article ->
-                emit(NewsResult.Success(article.toArticle()))
-                return@flow
-            }
+    override suspend fun getArticle(articleId: String): Flow<NewsResult<Article>> = flow {
+        if (articleId.isEmpty()) {
+            emit(NewsResult.Error("No Data"))
+            return@flow
+        }
 
-            try {
-                val remoteArticle: NewsListDto = httpClient.get(BASE_URL) {
-                    parameter("apikey", BuildConfig.API_KEY)
-                    parameter("id", articleId)
-                }.body()
-                if (remoteArticle.results?.isNotEmpty() == true) {
-                    emit(NewsResult.Success(data = remoteArticle.results[0].toArticle()))
-                } else {
-                    emit(NewsResult.Error("No Data"))
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                if (e is CancellationException) throw e
+        articleDao.getArticleById(articleId)?.let { article ->
+            emit(NewsResult.Success(article.toArticle()))
+            return@flow
+        }
+
+        if (!networkMonitor.isCurrentlyOnline()) {
+            emit(NewsResult.Error("No Data"))
+            return@flow
+        }
+
+        try {
+            val language = languageRepository.getLanguage().toApiCode()
+            val remoteArticle: NewsListDto = httpClient.get(BASE_URL) {
+                parameter("apikey", BuildConfig.API_KEY)
+                parameter("id", articleId)
+                parameter("language", language)
+            }.body()
+
+            if (remoteArticle.results?.isNotEmpty() == true) {
+                val article = remoteArticle.results[0].toArticle()
+                articleDao.upsertArticle(
+                    listOf(article.toArticleEntity())
+                )
+                emit(NewsResult.Success(article))
+            } else {
                 emit(NewsResult.Error("No Data"))
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            if (e is CancellationException) throw e
+            emit(NewsResult.Error("No Data"))
         }
     }
 
-    override suspend fun pagination(nextPage: String?,language: String): Flow<NewsResult<NewsList>> {
-        return flow {
-            val remoteNewsList = try {
-                getRemote(nextPage,language)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                if (e is CancellationException) throw e
-                null
-            }
-            remoteNewsList?.let {
-                articleDao.upsertArticle(remoteNewsList.articles.map { it.toArticleEntity() })
-                emit(NewsResult.Success(remoteNewsList))
-                return@flow
-            }
+    override suspend fun pagination(nextPage: String?): Flow<NewsResult<NewsList>> = flow {
+        if (nextPage.isNullOrBlank()) {
+            emit(NewsResult.Error("No next page"))
+            return@flow
         }
+
+        if (!networkMonitor.isCurrentlyOnline()) {
+            emit(NewsResult.Error("Offline"))
+            return@flow
+        }
+
+        val language = languageRepository.getLanguage().toApiCode()
+        val remoteNewsList = try {
+            getRemote(nextPage, language)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            if (e is CancellationException) throw e
+            null
+        }
+        remoteNewsList?.let {
+            articleDao.upsertArticle(
+                it.articles.map { article -> article.toArticleEntity() }
+            )
+            emit(NewsResult.Success(it))
+            return@flow
+        }
+        emit(NewsResult.Error("Could not load next page"))
+    }
+
+    private fun AppLanguage.toApiCode(): String = when (this) {
+        AppLanguage.ENGLISH -> "en"
+        AppLanguage.PERSIAN -> "fa"
     }
 }
